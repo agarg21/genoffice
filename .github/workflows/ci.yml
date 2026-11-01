@@ -174,17 +174,79 @@ jobs:
       - name: Check committed fixtures match the generator
         run: git diff --exit-code -- fixtures/generated
 
+  # Unit tests run in parallel legs, split by workspace. The two heaviest
+  # workspaces get their own legs; "rest" runs every other workspace listed in
+  # the root `test` script, so a new workspace is picked up automatically.
+  unit:
+    name: unit (${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [docs, sheets+markdown, rest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust
+        # SHA-pinned (third-party action); the ref no longer selects the
+        # toolchain, so it is passed explicitly.
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (xlsx-sidecar)
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/sheets/native/xlsx-engine
+
+      # electron's postinstall downloads its binary from GitHub Releases on every
+      # fresh install; a cache hit skips the download (and its 5xx flakes)
+      - name: Cache electron binaries
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/electron
+          # own prefix: the build workflows' electron-* entries also hold
+          # ~/.cache/electron-builder, and a saved key is never updated
+          key: electron-bin-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-bin-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Regenerate test fixtures
+        run: npm run fixtures
+
       # pptx-engine's OOXML schema gate validates saved decks with xmllint
       # (tools/ooxml-validate); the runner image is not guaranteed to have it.
       - name: Install xmllint
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils
 
       - name: Test
-        run: npm test
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          set -euo pipefail
+          case "$GROUP" in
+            docs) ws="@genoffice/docs" ;;
+            sheets+markdown) ws="@genoffice/sheets @genoffice/markdown" ;;
+            rest)
+              ws=$(node -p "require('./package.json').scripts.test.match(/-w (\\S+)/g).map(s => s.slice(3)).filter(w => !['@genoffice/docs', '@genoffice/sheets', '@genoffice/markdown'].includes(w)).join(' ')") ;;
+          esac
+          for w in $ws; do npm run test -w "$w"; done
 
       # Preservation gate: a no-op-adjacent edit through the OOXML gateway must
       # leave every untouched package entry byte-identical (fails closed otherwise).
       - name: Sheets compatibility gate
+        if: matrix.group == 'sheets+markdown'
         run: |
           npm run fixtures -w @genoffice/sheets
           npm run compat -w @genoffice/sheets
